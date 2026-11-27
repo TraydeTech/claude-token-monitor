@@ -1,6 +1,8 @@
 """Main application window."""
 
 import gi
+import random
+import subprocess
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import Gtk, Adw, GLib, Pango
@@ -11,6 +13,19 @@ from .collector import collect_window_stats, get_hourly_buckets, WINDOW_HOURS
 
 REFRESH_INTERVAL_MS = 10_000
 DEFAULT_LIMIT = 200_000
+
+FRASES_20PCT = [
+    "🚨 Ei! Só 20% dos tokens restando! Hora de economizar palavras...",
+    "😱 20% de tokens! Fala mais curto, humano!",
+    "⚠️ Atenção! Tokens acabando! Seja direto ao ponto!",
+    "🔥 Quase sem tokens! Responde com sim ou não!",
+    "🐢 Vai devagar! Só 20% dos tokens sobraram!",
+    "😅 20% restante! Claude tá quase mudo...",
+    "🧠 Neurônios escassos! 20% de tokens no limite!",
+    "💸 Tokens voando! Economize antes que acabe tudo!",
+    "🪫 Bateria de tokens fraca! 20% restante!",
+    "😬 Ei! 20% dos tokens! Vai com calma nas perguntas!",
+]
 
 CSS = """
 .pct-label {
@@ -79,6 +94,7 @@ class MainWindow(Adw.ApplicationWindow):
         super().__init__(application=app)
         self._limit = token_limit
         self._timer_id = None
+        self._notified_20pct = False
 
         self.set_title("Claude Token Monitor")
         self.set_default_size(400, 680)
@@ -127,6 +143,19 @@ class MainWindow(Adw.ApplicationWindow):
         self._status_dot = Gtk.Label()
         self._status_dot.set_markup('<span color="#34C77A">●</span>')
         header.append(self._status_dot)
+
+        minimize_btn = Gtk.Button(label="⎯")
+        minimize_btn.add_css_class("flat")
+        minimize_btn.set_tooltip_text("Minimizar")
+        minimize_btn.connect("clicked", lambda _: self.minimize())
+        header.append(minimize_btn)
+
+        close_btn = Gtk.Button(label="✕")
+        close_btn.add_css_class("flat")
+        close_btn.set_tooltip_text("Fechar")
+        close_btn.connect("clicked", lambda _: self.close())
+        header.append(close_btn)
+
         root.append(header)
 
         # ── Warning banner (hidden by default) ───────────────────
@@ -405,6 +434,23 @@ class MainWindow(Adw.ApplicationWindow):
             self._warning_label.set_label(f"Atenção: {(1-pct)*100:.1f}% do limite restante.")
         else:
             self._warning_box.set_visible(False)
+
+        # Notificação engraçada aos 20% restantes (80% usado)
+        if pct >= 0.80 and not self._notified_20pct:
+            self._notified_20pct = True
+            frase = random.choice(FRASES_20PCT)
+            try:
+                subprocess.Popen([
+                    "notify-send",
+                    "--urgency=critical",
+                    "--icon=dialog-warning",
+                    "Claude Token Monitor",
+                    frase,
+                ])
+            except FileNotFoundError:
+                pass
+        elif pct < 0.80:
+            self._notified_20pct = False
 
         # Meta info
         sessions = len(set(e.session_id for e in stats.entries))
