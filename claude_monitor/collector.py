@@ -162,6 +162,66 @@ def get_hourly_buckets(entries: list, hours: int = 4) -> list[tuple[datetime, in
     return [(b["start"], b["tokens"]) for b in buckets.values()]
 
 
+def get_cost_history() -> dict:
+    """Returns cost history grouped by local date."""
+    projects_dir = get_projects_dir()
+    today = datetime.now().date()
+    yesterday = today - timedelta(days=1)
+    seven_days_ago = today - timedelta(days=7)
+
+    daily: dict = {}
+
+    if os.path.exists(projects_dir):
+        jsonl_files = glob.glob(os.path.join(projects_dir, "**/*.jsonl"), recursive=True)
+        for filepath in jsonl_files:
+            try:
+                with open(filepath, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            data = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if data.get("type") != "assistant":
+                            continue
+                        cost = data.get("costUSD", 0.0) or 0.0
+                        if cost == 0.0:
+                            continue
+                        ts_str = data.get("timestamp", "")
+                        if not ts_str:
+                            continue
+                        try:
+                            ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                        except ValueError:
+                            continue
+                        local_date = ts.astimezone().date()
+                        if local_date < seven_days_ago:
+                            continue
+                        daily[local_date] = daily.get(local_date, 0.0) + cost
+            except (OSError, IOError):
+                continue
+
+    today_cost = daily.get(today, 0.0)
+    yesterday_cost = daily.get(yesterday, 0.0)
+    week_cost = sum(daily.values())
+
+    day_names = ["Seg", "Ter", "Qua", "Qui", "Sex", "Sáb", "Dom"]
+    daily_list = []
+    for i in range(6, -1, -1):
+        d = today - timedelta(days=i)
+        name = day_names[d.weekday()]
+        daily_list.append((name, daily.get(d, 0.0)))
+
+    return {
+        "today": today_cost,
+        "yesterday": yesterday_cost,
+        "week": week_cost,
+        "daily": daily_list,
+    }
+
+
 def _empty_stats(now: datetime, window_start: datetime) -> WindowStats:
     return WindowStats(
         entries=[],

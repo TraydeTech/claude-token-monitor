@@ -8,11 +8,15 @@ gi.require_version("Adw", "1")
 from gi.repository import Gtk, Adw, GLib, Pango
 
 from .gauge import GaugeWidget, MiniBarChart
-from .collector import collect_window_stats, get_hourly_buckets, WINDOW_HOURS
+from .collector import collect_window_stats, get_hourly_buckets, get_cost_history, WINDOW_HOURS
+from . import settings as settings_mod
 
+try:
+    from .tray import TrayIcon
+    _TRAY_AVAILABLE = True
+except Exception:
+    _TRAY_AVAILABLE = False
 
-REFRESH_INTERVAL_MS = 10_000
-DEFAULT_LIMIT = 200_000
 
 FRASES_20PCT = [
     "🚨 Ei! Só 20% dos tokens restando! Hora de economizar palavras...",
@@ -90,21 +94,30 @@ def _fmt(n: int) -> str:
 
 
 class MainWindow(Adw.ApplicationWindow):
-    def __init__(self, app, token_limit: int = DEFAULT_LIMIT):
+    def __init__(self, app, token_limit: int = None):
         super().__init__(application=app)
-        self._limit = token_limit
+        self._settings = settings_mod.load()
+        if token_limit is not None:
+            self._settings["token_limit"] = token_limit
+        self._limit = self._settings["token_limit"]
         self._timer_id = None
         self._notified_20pct = False
+        self._tray = None
 
         self.set_title("Claude Token Monitor")
-        self.set_default_size(400, 680)
+        self.set_default_size(400, 720)
         self.set_resizable(True)
         self.set_size_request(300, 480)
 
         self._apply_css()
+        self._apply_theme()
         self._build_ui()
         self._refresh()
         self._start_timer()
+        self._init_tray(app)
+
+        if self._settings.get("always_on_top"):
+            GLib.idle_add(self._apply_always_on_top)
 
     def _apply_css(self):
         provider = Gtk.CssProvider()
@@ -113,6 +126,22 @@ class MainWindow(Adw.ApplicationWindow):
             self.get_display(), provider,
             Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
         )
+
+    def _apply_theme(self):
+        style_mgr = Adw.StyleManager.get_default()
+        if self._settings.get("dark_mode", True):
+            style_mgr.set_color_scheme(Adw.ColorScheme.FORCE_DARK)
+        else:
+            style_mgr.set_color_scheme(Adw.ColorScheme.FORCE_LIGHT)
+
+    def _init_tray(self, app):
+        if not _TRAY_AVAILABLE:
+            return
+        try:
+            self._tray = TrayIcon()
+            self._tray.start(self, app)
+        except Exception:
+            self._tray = None
 
     def _build_ui(self):
         scroll = Gtk.ScrolledWindow()
@@ -144,6 +173,14 @@ class MainWindow(Adw.ApplicationWindow):
         self._status_dot.set_markup('<span color="#34C77A">●</span>')
         header.append(self._status_dot)
 
+        theme_btn = Gtk.Button()
+        theme_btn.add_css_class("flat")
+        theme_btn.set_tooltip_text("Alternar tema")
+        self._theme_btn = theme_btn
+        self._update_theme_btn_label()
+        theme_btn.connect("clicked", self._toggle_theme)
+        header.append(theme_btn)
+
         minimize_btn = Gtk.Button(label="⎯")
         minimize_btn.add_css_class("flat")
         minimize_btn.set_tooltip_text("Minimizar")
@@ -158,7 +195,7 @@ class MainWindow(Adw.ApplicationWindow):
 
         root.append(header)
 
-        # ── Warning banner (hidden by default) ───────────────────
+        # ── Warning banner ────────────────────────────────────────
         self._warning_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         self._warning_box.add_css_class("warning-banner")
         self._warning_box.set_margin_bottom(10)
@@ -171,12 +208,11 @@ class MainWindow(Adw.ApplicationWindow):
         self._warning_box.set_visible(False)
         root.append(self._warning_box)
 
-        # ── Main card: gauge + big pct + meta info ────────────────
+        # ── Main card ─────────────────────────────────────────────
         main_card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         main_card.add_css_class("card")
         main_card.set_margin_bottom(10)
 
-        # Gauge + percentage side by side
         top_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=16)
         top_row.set_margin_top(16)
         top_row.set_margin_start(16)
@@ -209,7 +245,6 @@ class MainWindow(Adw.ApplicationWindow):
         self._limit_lbl.set_halign(Gtk.Align.START)
         right_col.append(self._limit_lbl)
 
-        # Progress bar
         self._progress = Gtk.LevelBar()
         self._progress.set_min_value(0)
         self._progress.set_max_value(1)
@@ -220,13 +255,11 @@ class MainWindow(Adw.ApplicationWindow):
         top_row.append(right_col)
         main_card.append(top_row)
 
-        # Separator
         sep = Gtk.Separator()
         sep.set_margin_start(16)
         sep.set_margin_end(16)
         main_card.append(sep)
 
-        # Meta info grid: sessions, messages, avg, velocity
         meta_grid = Gtk.Grid()
         meta_grid.set_column_spacing(0)
         meta_grid.set_row_spacing(0)
@@ -246,15 +279,12 @@ class MainWindow(Adw.ApplicationWindow):
         for key, label, default, row, col in meta_items:
             box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
             box.set_halign(Gtk.Align.CENTER)
-
             val = Gtk.Label(label=default)
             val.add_css_class("meta-value")
             box.append(val)
-
             lbl = Gtk.Label(label=label)
             lbl.add_css_class("meta-label")
             box.append(lbl)
-
             meta_grid.attach(box, col, row, 1, 1)
             self._meta[key] = val
 
@@ -305,24 +335,21 @@ class MainWindow(Adw.ApplicationWindow):
         ]:
             box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
             box.add_css_class("card")
-
             val_lbl = Gtk.Label(label="0")
             val_lbl.add_css_class("stat-value")
             val_lbl.set_halign(Gtk.Align.CENTER)
             box.append(val_lbl)
-
             lbl = Gtk.Label(label=f"{icon} {label}")
             lbl.add_css_class("stat-label")
             lbl.set_halign(Gtk.Align.CENTER)
             lbl.set_margin_bottom(4)
             box.append(lbl)
-
             grid.attach(box, col, row, 1, 1)
             self._stat_widgets[key] = val_lbl
 
         root.append(grid)
 
-        # ── Cost + model row ──────────────────────────────────────
+        # ── Cost + settings row ───────────────────────────────────
         cost_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
         cost_box.add_css_class("card")
         cost_box.set_margin_bottom(10)
@@ -341,12 +368,53 @@ class MainWindow(Adw.ApplicationWindow):
         cost_left.append(self._cost_label)
         cost_box.append(cost_left)
 
-        limit_btn = Gtk.Button(label="⚙ Limite")
+        limit_btn = Gtk.Button(label="⚙ Config")
         limit_btn.add_css_class("flat")
         limit_btn.set_valign(Gtk.Align.CENTER)
-        limit_btn.connect("clicked", self._show_limit_dialog)
+        limit_btn.connect("clicked", self._show_settings_dialog)
         cost_box.append(limit_btn)
         root.append(cost_box)
+
+        # ── Cost history card ─────────────────────────────────────
+        hist_title = Gtk.Label(label="HISTÓRICO DE CUSTO")
+        hist_title.add_css_class("section-title")
+        hist_title.set_halign(Gtk.Align.START)
+        hist_title.set_margin_bottom(6)
+        root.append(hist_title)
+
+        hist_card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        hist_card.add_css_class("card")
+        hist_card.set_margin_bottom(10)
+
+        hist_grid = Gtk.Grid()
+        hist_grid.set_column_spacing(0)
+        hist_grid.set_row_spacing(0)
+        hist_grid.set_column_homogeneous(True)
+        hist_grid.set_margin_top(12)
+        hist_grid.set_margin_bottom(14)
+        hist_grid.set_margin_start(16)
+        hist_grid.set_margin_end(16)
+
+        self._hist = {}
+        hist_items = [
+            ("today",     "Hoje",      "$0.00", 0),
+            ("yesterday", "Ontem",     "$0.00", 1),
+            ("week",      "7 dias",    "$0.00", 2),
+        ]
+        for key, label, default, col in hist_items:
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+            box.set_halign(Gtk.Align.CENTER)
+            val = Gtk.Label(label=default)
+            val.add_css_class("meta-value")
+            box.append(val)
+            lbl = Gtk.Label(label=label)
+            lbl.add_css_class("meta-label")
+            box.append(lbl)
+            hist_grid.attach(box, col, 0, 1, 1)
+            self._hist[key] = val
+
+        hist_card.append(hist_grid)
+        root.append(hist_card)
 
         # ── Chart ─────────────────────────────────────────────────
         chart_title = Gtk.Label(label="ATIVIDADE — ÚLTIMAS 4H (15 MIN/BARRA)")
@@ -394,18 +462,16 @@ class MainWindow(Adw.ApplicationWindow):
         root.append(footer)
 
     def _refresh(self):
-        from datetime import datetime, timezone
+        from datetime import datetime, timezone, timedelta
         stats = collect_window_stats(self._limit)
 
         effective = stats.effective_tokens
         pct = effective / self._limit if self._limit > 0 else 0.0
         pct_str = f"{pct * 100:.1f}%"
 
-        # Gauge
         self._gauge.set_value(pct, pct_str)
         self._progress.set_value(min(pct, 1.0))
 
-        # Big percentage
         for cls in ["pct-green", "pct-yellow", "pct-orange", "pct-red"]:
             self._pct_label.remove_css_class(cls)
         if pct < 0.6:
@@ -425,7 +491,8 @@ class MainWindow(Adw.ApplicationWindow):
         self._tokens_used_lbl.set_label(f"{effective:,} tokens usados")
         self._limit_lbl.set_label(f"Limite: {self._limit:,}")
 
-        # Warning banner
+        alert_pct = self._settings.get("alert_threshold", 80) / 100.0
+
         if pct >= 0.90:
             self._warning_box.set_visible(True)
             self._warning_label.set_label(f"Limite crítico! {(1-pct)*100:.1f}% restante.")
@@ -435,8 +502,7 @@ class MainWindow(Adw.ApplicationWindow):
         else:
             self._warning_box.set_visible(False)
 
-        # Notificação engraçada aos 20% restantes (80% usado)
-        if pct >= 0.80 and not self._notified_20pct:
+        if pct >= alert_pct and not self._notified_20pct:
             self._notified_20pct = True
             frase = random.choice(FRASES_20PCT)
             try:
@@ -449,14 +515,16 @@ class MainWindow(Adw.ApplicationWindow):
                 ])
             except FileNotFoundError:
                 pass
-        elif pct < 0.80:
+            try:
+                subprocess.Popen(["aplay", "-q", "/usr/share/sounds/alsa/Front_Center.wav"])
+            except Exception:
+                pass
+        elif pct < alert_pct:
             self._notified_20pct = False
 
-        # Meta info
         sessions = len(set(e.session_id for e in stats.entries))
         messages = len(stats.entries)
         avg = effective // messages if messages > 0 else 0
-        # velocity: tokens in last 60 min
         from datetime import timedelta
         now = datetime.now(timezone.utc)
         last_hour = [e for e in stats.entries if e.timestamp > now - timedelta(hours=1)]
@@ -467,7 +535,6 @@ class MainWindow(Adw.ApplicationWindow):
         self._meta["avg"].set_label(_fmt(avg))
         self._meta["velocity"].set_label(_fmt(velocity))
 
-        # Countdown
         remaining = stats.time_until_next_expiry
         if remaining is not None:
             total_sec = int(remaining.total_seconds())
@@ -484,36 +551,160 @@ class MainWindow(Adw.ApplicationWindow):
             self._countdown.set_label("--:--:--")
             self._expiry_label.set_label("Sem uso nas últimas 4 horas")
 
-        # Stat grid
         self._stat_widgets["output"].set_label(_fmt(stats.total_output))
         self._stat_widgets["input"].set_label(_fmt(stats.total_input))
         self._stat_widgets["cache_cr"].set_label(_fmt(stats.total_cache_creation))
         self._stat_widgets["cache_rd"].set_label(_fmt(stats.total_cache_read))
         self._cost_label.set_label(f"${stats.total_cost:.4f}")
 
-        # Chart
+        try:
+            history = get_cost_history()
+            self._hist["today"].set_label(f"${history['today']:.2f}")
+            self._hist["yesterday"].set_label(f"${history['yesterday']:.2f}")
+            self._hist["week"].set_label(f"${history['week']:.2f}")
+        except Exception:
+            pass
+
         buckets = get_hourly_buckets(stats.entries, hours=WINDOW_HOURS)
         self._chart.set_data([v for _, v in buckets])
 
-        # Footer
         self._last_update.set_label(f"Atualizado: {datetime.now().strftime('%H:%M:%S')}")
+
+        if self._tray:
+            try:
+                self._tray.update_pct(pct * 100)
+            except Exception:
+                pass
+
         return True
 
     def _start_timer(self):
-        self._timer_id = GLib.timeout_add(REFRESH_INTERVAL_MS, self._refresh)
+        interval = self._settings.get("refresh_interval_ms", 10_000)
+        self._timer_id = GLib.timeout_add(interval, self._refresh)
 
-    def _show_limit_dialog(self, _):
+    def _restart_timer(self):
+        if self._timer_id is not None:
+            GLib.source_remove(self._timer_id)
+            self._timer_id = None
+        self._start_timer()
+
+    def _toggle_theme(self, _=None):
+        self._settings["dark_mode"] = not self._settings.get("dark_mode", True)
+        self._apply_theme()
+        self._update_theme_btn_label()
+        settings_mod.save(self._settings)
+
+    def _update_theme_btn_label(self):
+        if self._settings.get("dark_mode", True):
+            self._theme_btn.set_label("☀")
+        else:
+            self._theme_btn.set_label("🌙")
+
+    def _toggle_always_on_top(self):
+        self._settings["always_on_top"] = not self._settings.get("always_on_top", False)
+        settings_mod.save(self._settings)
+        self._apply_always_on_top()
+
+    def _apply_always_on_top(self):
+        try:
+            subprocess.Popen(
+                ["wmctrl", "-r", "Claude Token Monitor", "-b", "toggle,above"],
+                stderr=subprocess.DEVNULL,
+            )
+        except FileNotFoundError:
+            try:
+                subprocess.Popen(
+                    ["xdotool", "getactivewindow", "windowraise"],
+                    stderr=subprocess.DEVNULL,
+                )
+            except FileNotFoundError:
+                pass
+        return False
+
+    def _show_settings_dialog(self, _=None):
         dialog = Adw.MessageDialog(
             transient_for=self,
-            heading="Limite de tokens",
-            body="Tokens máximos na janela de 4 horas:",
+            heading="Configurações",
+            body="Ajuste as preferências do monitor:",
         )
-        entry = Gtk.Entry()
-        entry.set_text(str(self._limit))
-        entry.set_input_purpose(Gtk.InputPurpose.NUMBER)
-        entry.set_halign(Gtk.Align.CENTER)
-        entry.set_width_chars(12)
-        dialog.set_extra_child(entry)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        box.set_margin_top(8)
+
+        # Token limit
+        limit_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        limit_lbl = Gtk.Label(label="Limite de tokens:")
+        limit_lbl.set_hexpand(True)
+        limit_lbl.set_halign(Gtk.Align.START)
+        limit_row.append(limit_lbl)
+        limit_entry = Gtk.Entry()
+        limit_entry.set_text(str(self._limit))
+        limit_entry.set_input_purpose(Gtk.InputPurpose.NUMBER)
+        limit_entry.set_width_chars(10)
+        limit_row.append(limit_entry)
+        box.append(limit_row)
+
+        # Alert threshold
+        threshold_row = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        threshold_hdr = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        threshold_lbl = Gtk.Label(label="Alerta ao atingir:")
+        threshold_lbl.set_hexpand(True)
+        threshold_lbl.set_halign(Gtk.Align.START)
+        threshold_hdr.append(threshold_lbl)
+        threshold_val_lbl = Gtk.Label(label=f"{self._settings.get('alert_threshold', 80)}%")
+        threshold_val_lbl.set_halign(Gtk.Align.END)
+        threshold_hdr.append(threshold_val_lbl)
+        threshold_row.append(threshold_hdr)
+        threshold_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 50, 95, 5)
+        threshold_scale.set_value(self._settings.get("alert_threshold", 80))
+        threshold_scale.set_hexpand(True)
+        threshold_scale.set_draw_value(False)
+        def on_threshold_change(s):
+            threshold_val_lbl.set_label(f"{int(s.get_value())}%")
+        threshold_scale.connect("value-changed", on_threshold_change)
+        threshold_row.append(threshold_scale)
+        box.append(threshold_row)
+
+        # Refresh interval
+        interval_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        interval_lbl = Gtk.Label(label="Intervalo de atualização:")
+        interval_lbl.set_hexpand(True)
+        interval_lbl.set_halign(Gtk.Align.START)
+        interval_row.append(interval_lbl)
+        interval_model = Gtk.StringList.new(["5s", "10s", "30s", "60s"])
+        interval_map = [5_000, 10_000, 30_000, 60_000]
+        interval_combo = Gtk.DropDown.new(interval_model, None)
+        cur_interval = self._settings.get("refresh_interval_ms", 10_000)
+        cur_idx = interval_map.index(cur_interval) if cur_interval in interval_map else 1
+        interval_combo.set_selected(cur_idx)
+        interval_row.append(interval_combo)
+        box.append(interval_row)
+
+        # Dark mode
+        dark_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        dark_lbl = Gtk.Label(label="Modo escuro:")
+        dark_lbl.set_hexpand(True)
+        dark_lbl.set_halign(Gtk.Align.START)
+        dark_row.append(dark_lbl)
+        dark_switch = Gtk.Switch()
+        dark_switch.set_active(self._settings.get("dark_mode", True))
+        dark_switch.set_valign(Gtk.Align.CENTER)
+        dark_row.append(dark_switch)
+        box.append(dark_row)
+
+        # Always on top
+        top_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        top_lbl = Gtk.Label(label="Sempre no topo:")
+        top_lbl.set_hexpand(True)
+        top_lbl.set_halign(Gtk.Align.START)
+        top_row.append(top_lbl)
+        top_switch = Gtk.Switch()
+        top_switch.set_active(self._settings.get("always_on_top", False))
+        top_switch.set_valign(Gtk.Align.CENTER)
+        top_row.append(top_switch)
+        box.append(top_row)
+
+        dialog.set_extra_child(box)
         dialog.add_response("cancel", "Cancelar")
         dialog.add_response("ok", "Salvar")
         dialog.set_default_response("ok")
@@ -522,13 +713,35 @@ class MainWindow(Adw.ApplicationWindow):
         def on_response(d, response):
             if response == "ok":
                 try:
-                    val = int(entry.get_text().replace(",", "").replace(".", ""))
+                    val = int(limit_entry.get_text().replace(",", "").replace(".", ""))
                     if val > 0:
                         self._limit = val
-                        self._refresh()
+                        self._settings["token_limit"] = val
                 except ValueError:
                     pass
+
+                self._settings["alert_threshold"] = int(threshold_scale.get_value())
+                self._settings["refresh_interval_ms"] = interval_map[interval_combo.get_selected()]
+
+                new_dark = dark_switch.get_active()
+                if new_dark != self._settings.get("dark_mode", True):
+                    self._settings["dark_mode"] = new_dark
+                    self._apply_theme()
+                    self._update_theme_btn_label()
+
+                new_top = top_switch.get_active()
+                if new_top != self._settings.get("always_on_top", False):
+                    self._settings["always_on_top"] = new_top
+                    self._apply_always_on_top()
+
+                settings_mod.save(self._settings)
+                self._restart_timer()
+                self._refresh()
             d.destroy()
 
         dialog.connect("response", on_response)
         dialog.present()
+
+    # Keep old name as alias for compatibility
+    def _show_limit_dialog(self, _=None):
+        self._show_settings_dialog(_)
