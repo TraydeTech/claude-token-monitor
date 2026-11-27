@@ -31,6 +31,19 @@ FRASES_20PCT = [
     "😬 Ei! 20% dos tokens! Vai com calma nas perguntas!",
 ]
 
+FRASES_AUDIO = [
+    "Atenção! Apenas vinte por cento dos tokens restando. Hora de economizar!",
+    "Vinte por cento de tokens! Fala mais curto, humano!",
+    "Tokens acabando! Seja direto ao ponto!",
+    "Quase sem tokens! Responde com sim ou não!",
+    "Vai devagar! Só vinte por cento dos tokens sobraram!",
+    "Vinte por cento restante! Claude tá quase mudo!",
+    "Neurônios escassos! Vinte por cento de tokens no limite!",
+    "Tokens voando! Economize antes que acabe tudo!",
+    "Bateria de tokens fraca! Vinte por cento restante!",
+    "Ei! Vai com calma nas perguntas! Só vinte por cento dos tokens!",
+]
+
 CSS = """
 .pct-label {
     font-size: 46px;
@@ -516,7 +529,8 @@ class MainWindow(Adw.ApplicationWindow):
             except FileNotFoundError:
                 pass
             try:
-                subprocess.Popen(["aplay", "-q", "/usr/share/sounds/alsa/Front_Center.wav"])
+                frase_audio = FRASES_AUDIO[FRASES_20PCT.index(frase)]
+                subprocess.Popen(["espeak-ng", "-v", "pt-br", "-s", "140", frase_audio])
             except Exception:
                 pass
         elif pct < alert_pct:
